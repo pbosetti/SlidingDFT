@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(SlidingDFT LANGUAGES CXX)
 
 include(CMakePackageConfigHelpers)
+include(CTest)
 include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -33,6 +34,13 @@ add_executable(sliding_dft_example
 )
 
 target_link_libraries(sliding_dft_example PRIVATE SlidingDFT::SlidingDFT)
+
+if(BUILD_TESTING)
+  add_test(
+    NAME sliding_dft_example_runs
+    COMMAND sliding_dft_example
+  )
+endif()
 
 if(MSVC)
   target_compile_options(SlidingDFT PRIVATE /W4 /permissive-)
