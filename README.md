@@ -1,5 +1,7 @@
 # SlidingDFT
 
+[![CI](https://github.com/pbosetti/SlidingDFT/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/pbosetti/SlidingDFT/actions/workflows/main.yml)
+
 `SlidingDFT` is a small C++20 library that maintains a sliding discrete Fourier
 transform over a fixed-size window of real-valued samples.
 
