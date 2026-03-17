@@ -18,7 +18,19 @@ add_library(SlidingDFT STATIC
 
 add_library(SlidingDFT::SlidingDFT ALIAS SlidingDFT)
 
+add_library(SlidingDFTC SHARED
+  src/c_api.cpp
+)
+
+add_library(SlidingDFT::SlidingDFTC ALIAS SlidingDFTC)
+
 target_include_directories(SlidingDFT
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+target_include_directories(SlidingDFTC
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -28,6 +40,14 @@ target_compile_definitions(SlidingDFT
   PUBLIC
     $<$<BOOL:${SLIDINGDFT_USE_DOUBLE}>:SLIDINGDFT_USE_DOUBLE>
 )
+
+target_compile_definitions(SlidingDFTC
+  PUBLIC
+    $<$<BOOL:${SLIDINGDFT_USE_DOUBLE}>:SLIDINGDFT_USE_DOUBLE>
+    SLIDINGDFT_C_EXPORTS
+)
+
+target_link_libraries(SlidingDFTC PRIVATE SlidingDFT::SlidingDFT)
 
 add_executable(sliding_dft_example
   src/example.cpp
@@ -44,22 +64,27 @@ endif()
 
 if(MSVC)
   target_compile_options(SlidingDFT PRIVATE /W4 /permissive-)
+  target_compile_options(SlidingDFTC PRIVATE /W4 /permissive-)
   target_compile_options(sliding_dft_example PRIVATE /W4 /permissive-)
 else()
   target_compile_options(SlidingDFT PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(SlidingDFTC PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(sliding_dft_example PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND
    CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64|i[3-6]86)$")
   target_compile_options(SlidingDFT PRIVATE -mavx2)
+  target_compile_options(SlidingDFTC PRIVATE -mavx2)
   target_compile_options(sliding_dft_example PRIVATE -mavx2)
 endif()
 
 set_target_properties(SlidingDFT PROPERTIES OUTPUT_NAME SlidingDFT)
+set_target_properties(SlidingDFT PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(SlidingDFTC PROPERTIES OUTPUT_NAME SlidingDFTC)
 
 install(
-  TARGETS SlidingDFT
+  TARGETS SlidingDFT SlidingDFTC
   EXPORT SlidingDFTTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

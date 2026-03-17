@@ -15,12 +15,14 @@ The project builds a static library and installs public headers under
 ## Features
 
 - C++20 library with CMake build system
+- C interface
 - Static library target: `SlidingDFT::SlidingDFT`
 - SIMD backends where available
 - AVX2 on x86_64
 - NEON on ARM64, including Apple Silicon
 - `float` and `double` sample precision via CMake option
 - Installable CMake package and `FetchContent`-friendly layout
+- Python interface (see <python/README.md>)
 
 ## Build
 
