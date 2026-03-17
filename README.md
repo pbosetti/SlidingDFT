@@ -22,7 +22,7 @@ The project builds a static library and installs public headers under
 - NEON on ARM64, including Apple Silicon
 - `float` and `double` sample precision via CMake option
 - Installable CMake package and `FetchContent`-friendly layout
-- Python interface (see <python/README.md>)
+- Python interface (see [python/README.md](python/README.md))
 
 ## Build
 
