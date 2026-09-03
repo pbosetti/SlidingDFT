@@ -2,7 +2,7 @@
 #include <iostream>
 
 int main() {
-  constexpr std::size_t N = 256;
+  constexpr std::size_t N = 300;
   SlidingDFT sdft(N, 4096);
 
   for (std::size_t n = 0; n < 5000; ++n) {
