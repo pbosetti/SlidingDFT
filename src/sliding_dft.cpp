@@ -461,8 +461,10 @@ void SlidingDFT::recompute_fft_like() {
     xi[k] = sum_imag;
   }
 
+  // The recursion in update_bins() tracks the conjugate of the DFT of the
+  // window ordered from the oldest sample, independently of the phase _p.
   for (std::size_t k = 0; k < _k; ++k) {
-    _yr[k] = xr[k] * _pr[k] + xi[k] * _pi[k];
-    _yi[k] = -xr[k] * _pi[k] + xi[k] * _pr[k];
+    _yr[k] = xr[k];
+    _yi[k] = -xi[k];
   }
 }

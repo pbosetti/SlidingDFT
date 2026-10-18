@@ -5,7 +5,7 @@
 #include <new>
 #include <type_traits>
 
-#if defined(_MSC_VER)
+#if defined(_WIN32)
 #include <malloc.h>
 #endif
 
@@ -20,7 +20,7 @@ public:
 
   [[nodiscard]] T *allocate(std::size_t n) {
     void *p = nullptr;
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     p = _aligned_malloc(n * sizeof(T), Alignment);
     if (!p) {
       throw std::bad_alloc();
@@ -34,7 +34,7 @@ public:
   }
 
   void deallocate(T *p, std::size_t) noexcept {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     _aligned_free(p);
 #else
     free(p);

@@ -1,6 +1,7 @@
 # SlidingDFT
 
 [![CI](https://github.com/pbosetti/SlidingDFT/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/pbosetti/SlidingDFT/actions/workflows/main.yml)
+[![R](https://github.com/pbosetti/SlidingDFT/actions/workflows/r.yml/badge.svg?branch=main)](https://github.com/pbosetti/SlidingDFT/actions/workflows/r.yml)
 
 `SlidingDFT` is a small C++20 library that maintains a sliding discrete Fourier
 transform over a fixed-size window of real-valued samples.
@@ -23,6 +24,7 @@ The project builds a static library and installs public headers under
 - `float` and `double` sample precision via CMake option
 - Installable CMake package and `FetchContent`-friendly layout
 - Python interface (see [python/README.md](python/README.md))
+- R interface via Rcpp (see [r/README.md](r/README.md))
 
 ## Build
 

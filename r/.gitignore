@@ -1,0 +1,6 @@
+src/*.o
+src/*.so
+src/*.dll
+.Rproj.user
+*.tar.gz
+SlidingDFT.Rcheck/
