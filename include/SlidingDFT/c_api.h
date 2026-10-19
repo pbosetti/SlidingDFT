@@ -28,7 +28,8 @@ struct SlidingDFTHandle;
 /**
  * @brief Create a new sliding DFT instance.
  * @param window_size Number of samples in the analysis window.
- * @param renorm_interval Number of updates between phase renormalizations.
+ * @param renorm_interval Number of updates between exact recomputations of
+ *        the bins.
  * @return A valid handle on success, or `nullptr` on error.
  *
  * When creation fails, call sliding_dft_last_error() to retrieve the reason.

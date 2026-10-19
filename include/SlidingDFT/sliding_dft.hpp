@@ -3,6 +3,8 @@
 #include <SlidingDFT/allocator.hpp>
 #include <SlidingDFT/types.hpp>
 
+#include <complex>
+
 /**
  * @class SlidingDFT
  * @brief Sliding discrete Fourier transform for real-valued input streams.
@@ -18,7 +20,8 @@ public:
   /**
    * @brief Construct a sliding DFT for a fixed window length.
    * @param window_size Number of samples in the analysis window.
-   * @param renorm_interval Number of updates between phase renormalizations.
+   * @param renorm_interval Number of updates between exact recomputations
+   *        of the bins, which bound floating-point drift.
    * @throws std::invalid_argument If @p window_size is zero.
    */
   SlidingDFT(std::size_t window_size, std::size_t renorm_interval = 4096);
@@ -43,9 +46,7 @@ public:
 
 private:
   void update_bins(data_t delta);
-  void advance_phase();
   void power(data_t *out) const;
-  void renormalize_phase();
   void recompute_fft_like();
 
   std::size_t _n;
@@ -55,12 +56,17 @@ private:
   vec_t _yi;
   vec_t _wr;
   vec_t _wi;
-  vec_t _pr;
-  vec_t _pi;
   std::size_t _index;
   std::size_t _filled;
   std::size_t _count;
   std::size_t _renorm_interval;
+  // FFT used by recompute_fft_like(): radix-2 of size _fft_size, with
+  // Bluestein's algorithm when the window size is not a power of two.
+  std::size_t _fft_size;
+  std::vector<std::complex<double>> _fft_twiddle;
+  std::vector<std::complex<double>> _chirp;
+  std::vector<std::complex<double>> _chirp_fft;
+  std::vector<std::complex<double>> _fft_work;
 };
 
 using SlidingDFT_AVX2 = SlidingDFT;

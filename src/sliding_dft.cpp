@@ -1,8 +1,11 @@
 #include <SlidingDFT/sliding_dft.hpp>
 
+#include <algorithm>
+#include <bit>
 #include <cmath>
 #include <numbers>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -32,12 +35,46 @@ inline vec load(const data_t *p) { return vld1q_f32(p); }
 inline void store(data_t *p, vec v) { vst1q_f32(p, v); }
 #endif
 
+using Complex = std::complex<double>;
+
+// Plain complex product: std::complex operator* goes through the C99 Annex G
+// NaN/Inf recovery path (__muldc3), which is much slower.
+inline Complex mul(Complex a, Complex b) {
+  return {a.real() * b.real() - a.imag() * b.imag(),
+          a.real() * b.imag() + a.imag() * b.real()};
+}
+
+// In-place forward FFT of power-of-two size m, twiddle[j] = e^{-2 pi i j / m}.
+void fft_radix2(Complex *x, std::size_t m, const Complex *twiddle) {
+  for (std::size_t i = 1, j = 0; i < m; ++i) {
+    std::size_t bit = m >> 1;
+    for (; j & bit; bit >>= 1) {
+      j ^= bit;
+    }
+    j ^= bit;
+    if (i < j) {
+      std::swap(x[i], x[j]);
+    }
+  }
+  for (std::size_t len = 2; len <= m; len <<= 1) {
+    const std::size_t half = len / 2;
+    const std::size_t step = m / len;
+    for (std::size_t i = 0; i < m; i += len) {
+      for (std::size_t j = 0; j < half; ++j) {
+        const Complex t = mul(x[i + j + half], twiddle[j * step]);
+        x[i + j + half] = x[i + j] - t;
+        x[i + j] += t;
+      }
+    }
+  }
+}
+
 } // namespace
 
 SlidingDFT::SlidingDFT(std::size_t window_size, std::size_t renorm_interval)
     : _n(window_size), _k(window_size / 2 + 1), _buffer(window_size, 0),
-      _yr(_k, 0), _yi(_k, 0), _wr(_k, 0), _wi(_k, 0), _pr(_k, 1), _pi(_k, 0),
-      _index(0), _filled(0), _count(0), _renorm_interval(renorm_interval) {
+      _yr(_k, 0), _yi(_k, 0), _wr(_k, 0), _wi(_k, 0), _index(0), _filled(0),
+      _count(0), _renorm_interval(renorm_interval) {
   if (_n == 0) {
     throw std::invalid_argument("N > 0 required");
   }
@@ -49,8 +86,34 @@ SlidingDFT::SlidingDFT(std::size_t window_size, std::size_t renorm_interval)
     const data_t angle = two_pi_over_n * static_cast<data_t>(k);
     _wr[k] = std::cos(angle);
     _wi[k] = -std::sin(angle);
-    _pr[k] = 1;
-    _pi[k] = 0;
+  }
+
+  _fft_size = std::has_single_bit(_n) ? _n : std::bit_ceil(2 * _n - 1);
+  _fft_twiddle.resize(_fft_size / 2);
+  for (std::size_t j = 0; j < _fft_twiddle.size(); ++j) {
+    _fft_twiddle[j] = std::polar(1.0, -2.0 * std::numbers::pi_v<double> *
+                                          static_cast<double>(j) /
+                                          static_cast<double>(_fft_size));
+  }
+  _fft_work.resize(_fft_size);
+
+  if (_fft_size != _n) {
+    // Bluestein: chirp c_n = e^{i pi n^2 / N}, with n^2 reduced mod 2N to keep
+    // the angle accurate, and the FFT of the zero-padded symmetric chirp.
+    _chirp.resize(_n);
+    for (std::size_t n = 0; n < _n; ++n) {
+      const auto n2 = (static_cast<unsigned long long>(n) * n) % (2 * _n);
+      _chirp[n] =
+          std::polar(1.0, std::numbers::pi_v<double> * static_cast<double>(n2) /
+                              static_cast<double>(_n));
+    }
+    _chirp_fft.assign(_fft_size, 0.0);
+    _chirp_fft[0] = _chirp[0];
+    for (std::size_t n = 1; n < _n; ++n) {
+      _chirp_fft[n] = _chirp[n];
+      _chirp_fft[_fft_size - n] = _chirp[n];
+    }
+    fft_radix2(_chirp_fft.data(), _fft_size, _fft_twiddle.data());
   }
 }
 
@@ -65,10 +128,8 @@ void SlidingDFT::update(data_t sample) {
 
   const data_t delta = sample - old_sample;
   update_bins(delta);
-  advance_phase();
 
   if (++_count % _renorm_interval == 0) {
-    renormalize_phase();
     recompute_fft_like();
   }
 }
@@ -201,270 +262,76 @@ void SlidingDFT::update_bins(data_t delta) {
 #endif
 }
 
-void SlidingDFT::advance_phase() {
-#if defined(__AVX2__) && defined(SLIDINGDFT_USE_DOUBLE)
-  std::size_t k = 0;
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    const vec pr = load(&_pr[k]);
-    const vec pi = load(&_pi[k]);
-    const vec dr = load(&_wr[k]);
-    const vec di = _mm256_sub_pd(_mm256_setzero_pd(), load(&_wi[k]));
-
-#if defined(__FMA__)
-    const vec nr = _mm256_fmsub_pd(pr, dr, _mm256_mul_pd(pi, di));
-    const vec ni = _mm256_fmadd_pd(pr, di, _mm256_mul_pd(pi, dr));
-#else
-    const vec nr =
-        _mm256_sub_pd(_mm256_mul_pd(pr, dr), _mm256_mul_pd(pi, di));
-    const vec ni =
-        _mm256_add_pd(_mm256_mul_pd(pr, di), _mm256_mul_pd(pi, dr));
-#endif
-
-    store(&_pr[k], nr);
-    store(&_pi[k], ni);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t dr = _wr[k];
-    const data_t di = -_wi[k];
-    const data_t pr = _pr[k];
-    const data_t pi = _pi[k];
-    _pr[k] = pr * dr - pi * di;
-    _pi[k] = pr * di + pi * dr;
-  }
-#elif defined(__AVX2__)
-  std::size_t k = 0;
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    const vec pr = load(&_pr[k]);
-    const vec pi = load(&_pi[k]);
-    const vec dr = load(&_wr[k]);
-    const vec di = _mm256_sub_ps(_mm256_setzero_ps(), load(&_wi[k]));
-
-#if defined(__FMA__)
-    const vec nr = _mm256_fmsub_ps(pr, dr, _mm256_mul_ps(pi, di));
-    const vec ni = _mm256_fmadd_ps(pr, di, _mm256_mul_ps(pi, dr));
-#else
-    const vec nr =
-        _mm256_sub_ps(_mm256_mul_ps(pr, dr), _mm256_mul_ps(pi, di));
-    const vec ni =
-        _mm256_add_ps(_mm256_mul_ps(pr, di), _mm256_mul_ps(pi, dr));
-#endif
-
-    store(&_pr[k], nr);
-    store(&_pi[k], ni);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t dr = _wr[k];
-    const data_t di = -_wi[k];
-    const data_t pr = _pr[k];
-    const data_t pi = _pi[k];
-    _pr[k] = pr * dr - pi * di;
-    _pi[k] = pr * di + pi * dr;
-  }
-#elif defined(__ARM_NEON) && defined(SLIDINGDFT_USE_DOUBLE)
-  std::size_t k = 0;
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    const vec pr = load(&_pr[k]);
-    const vec pi = load(&_pi[k]);
-    const vec dr = load(&_wr[k]);
-    const vec di = vnegq_f64(load(&_wi[k]));
-
-    const vec nr = vsubq_f64(vmulq_f64(pr, dr), vmulq_f64(pi, di));
-    const vec ni = vaddq_f64(vmulq_f64(pr, di), vmulq_f64(pi, dr));
-
-    store(&_pr[k], nr);
-    store(&_pi[k], ni);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t dr = _wr[k];
-    const data_t di = -_wi[k];
-    const data_t pr = _pr[k];
-    const data_t pi = _pi[k];
-    _pr[k] = pr * dr - pi * di;
-    _pi[k] = pr * di + pi * dr;
-  }
-#elif defined(__ARM_NEON)
-  std::size_t k = 0;
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    const vec pr = load(&_pr[k]);
-    const vec pi = load(&_pi[k]);
-    const vec dr = load(&_wr[k]);
-    const vec di = vnegq_f32(load(&_wi[k]));
-
-    const vec nr = vsubq_f32(vmulq_f32(pr, dr), vmulq_f32(pi, di));
-    const vec ni = vaddq_f32(vmulq_f32(pr, di), vmulq_f32(pi, dr));
-
-    store(&_pr[k], nr);
-    store(&_pi[k], ni);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t dr = _wr[k];
-    const data_t di = -_wi[k];
-    const data_t pr = _pr[k];
-    const data_t pi = _pi[k];
-    _pr[k] = pr * dr - pi * di;
-    _pi[k] = pr * di + pi * dr;
-  }
-#else
-  for (std::size_t k = 0; k < _k; ++k) {
-    const data_t dr = _wr[k];
-    const data_t di = -_wi[k];
-    const data_t pr = _pr[k];
-    const data_t pi = _pi[k];
-    _pr[k] = pr * dr - pi * di;
-    _pi[k] = pr * di + pi * dr;
-  }
-#endif
-}
-
 void SlidingDFT::power(data_t *out) const {
-#if defined(__AVX2__) && defined(SLIDINGDFT_USE_DOUBLE)
   std::size_t k = 0;
+#if defined(__AVX2__) && defined(SLIDINGDFT_USE_DOUBLE)
   for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
     const vec yr = load(&_yr[k]);
     const vec yi = load(&_yi[k]);
-    const vec pr = load(&_pr[k]);
-    const vec pi = load(&_pi[k]);
-
 #if defined(__FMA__)
-    const vec xr = _mm256_fmsub_pd(yr, pr, _mm256_mul_pd(yi, pi));
-    const vec xi = _mm256_fmadd_pd(yr, pi, _mm256_mul_pd(yi, pr));
-    const vec pw = _mm256_fmadd_pd(xr, xr, _mm256_mul_pd(xi, xi));
+    store(&out[k], _mm256_fmadd_pd(yr, yr, _mm256_mul_pd(yi, yi)));
 #else
-    const vec xr =
-        _mm256_sub_pd(_mm256_mul_pd(yr, pr), _mm256_mul_pd(yi, pi));
-    const vec xi =
-        _mm256_add_pd(_mm256_mul_pd(yr, pi), _mm256_mul_pd(yi, pr));
-    const vec pw =
-        _mm256_add_pd(_mm256_mul_pd(xr, xr), _mm256_mul_pd(xi, xi));
+    store(&out[k], _mm256_add_pd(_mm256_mul_pd(yr, yr), _mm256_mul_pd(yi, yi)));
 #endif
-
-    store(&out[k], pw);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t xr = _yr[k] * _pr[k] - _yi[k] * _pi[k];
-    const data_t xi = _yr[k] * _pi[k] + _yi[k] * _pr[k];
-    out[k] = xr * xr + xi * xi;
   }
 #elif defined(__AVX2__)
-  std::size_t k = 0;
   for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
     const vec yr = load(&_yr[k]);
     const vec yi = load(&_yi[k]);
-    const vec pr = load(&_pr[k]);
-    const vec pi = load(&_pi[k]);
-
 #if defined(__FMA__)
-    const vec xr = _mm256_fmsub_ps(yr, pr, _mm256_mul_ps(yi, pi));
-    const vec xi = _mm256_fmadd_ps(yr, pi, _mm256_mul_ps(yi, pr));
-    const vec pw = _mm256_fmadd_ps(xr, xr, _mm256_mul_ps(xi, xi));
+    store(&out[k], _mm256_fmadd_ps(yr, yr, _mm256_mul_ps(yi, yi)));
 #else
-    const vec xr =
-        _mm256_sub_ps(_mm256_mul_ps(yr, pr), _mm256_mul_ps(yi, pi));
-    const vec xi =
-        _mm256_add_ps(_mm256_mul_ps(yr, pi), _mm256_mul_ps(yi, pr));
-    const vec pw =
-        _mm256_add_ps(_mm256_mul_ps(xr, xr), _mm256_mul_ps(xi, xi));
+    store(&out[k], _mm256_add_ps(_mm256_mul_ps(yr, yr), _mm256_mul_ps(yi, yi)));
 #endif
-
-    store(&out[k], pw);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t xr = _yr[k] * _pr[k] - _yi[k] * _pi[k];
-    const data_t xi = _yr[k] * _pi[k] + _yi[k] * _pr[k];
-    out[k] = xr * xr + xi * xi;
   }
 #elif defined(__ARM_NEON) && defined(SLIDINGDFT_USE_DOUBLE)
-  std::size_t k = 0;
   for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
     const vec yr = load(&_yr[k]);
     const vec yi = load(&_yi[k]);
-    const vec pr = load(&_pr[k]);
-    const vec pi = load(&_pi[k]);
-
-    const vec xr = vsubq_f64(vmulq_f64(yr, pr), vmulq_f64(yi, pi));
-    const vec xi = vaddq_f64(vmulq_f64(yr, pi), vmulq_f64(yi, pr));
-    const vec pw = vaddq_f64(vmulq_f64(xr, xr), vmulq_f64(xi, xi));
-
-    store(&out[k], pw);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t xr = _yr[k] * _pr[k] - _yi[k] * _pi[k];
-    const data_t xi = _yr[k] * _pi[k] + _yi[k] * _pr[k];
-    out[k] = xr * xr + xi * xi;
+    store(&out[k], vaddq_f64(vmulq_f64(yr, yr), vmulq_f64(yi, yi)));
   }
 #elif defined(__ARM_NEON)
-  std::size_t k = 0;
   for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
     const vec yr = load(&_yr[k]);
     const vec yi = load(&_yi[k]);
-    const vec pr = load(&_pr[k]);
-    const vec pi = load(&_pi[k]);
-
-    const vec xr = vsubq_f32(vmulq_f32(yr, pr), vmulq_f32(yi, pi));
-    const vec xi = vaddq_f32(vmulq_f32(yr, pi), vmulq_f32(yi, pr));
-    const vec pw = vaddq_f32(vmulq_f32(xr, xr), vmulq_f32(xi, xi));
-
-    store(&out[k], pw);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t xr = _yr[k] * _pr[k] - _yi[k] * _pi[k];
-    const data_t xi = _yr[k] * _pi[k] + _yi[k] * _pr[k];
-    out[k] = xr * xr + xi * xi;
-  }
-#else
-  for (std::size_t k = 0; k < _k; ++k) {
-    const data_t xr = _yr[k] * _pr[k] - _yi[k] * _pi[k];
-    const data_t xi = _yr[k] * _pi[k] + _yi[k] * _pr[k];
-    out[k] = xr * xr + xi * xi;
+    store(&out[k], vaddq_f32(vmulq_f32(yr, yr), vmulq_f32(yi, yi)));
   }
 #endif
-}
-
-void SlidingDFT::renormalize_phase() {
-  for (std::size_t k = 0; k < _k; ++k) {
-    const data_t magnitude = std::hypot(_pr[k], _pi[k]);
-    if (magnitude > 0) {
-      _pr[k] /= magnitude;
-      _pi[k] /= magnitude;
-    } else {
-      _pr[k] = 1;
-      _pi[k] = 0;
-    }
+  // |X_k|^2 = |y_k|^2: y_k is the conjugate of the DFT of the window ordered
+  // from the oldest sample, so no phase reference is needed.
+  for (; k < _k; ++k) {
+    out[k] = _yr[k] * _yr[k] + _yi[k] * _yi[k];
   }
 }
 
 void SlidingDFT::recompute_fft_like() {
-  vec_t xr(_k, 0);
-  vec_t xi(_k, 0);
-
-  for (std::size_t k = 0; k < _k; ++k) {
-    data_t sum_real = 0;
-    data_t sum_imag = 0;
-    for (std::size_t n = 0; n < _n; ++n) {
-      const std::size_t pos = (_index + n) % _n;
-      const data_t sample = _buffer[pos];
-      const data_t angle = static_cast<data_t>(
-          -2.0 * std::numbers::pi_v<double> * static_cast<double>(k) *
-          static_cast<double>(n) / static_cast<double>(_n));
-      sum_real += sample * std::cos(angle);
-      sum_imag += sample * std::sin(angle);
-    }
-    xr[k] = sum_real;
-    xi[k] = sum_imag;
+  // DFT X_k of the window ordered from the oldest sample, in double precision.
+  Complex *x = _fft_work.data();
+  for (std::size_t n = 0; n < _n; ++n) {
+    const double sample = _buffer[(_index + n) % _n];
+    x[n] = _chirp.empty() ? Complex(sample) : sample * std::conj(_chirp[n]);
   }
 
-  // The recursion in update_bins() tracks the conjugate of the DFT of the
-  // window ordered from the oldest sample, independently of the phase _p.
+  if (_chirp.empty()) {
+    fft_radix2(x, _fft_size, _fft_twiddle.data());
+  } else {
+    // X_k = conj(c_k) * (a * c)_k, the circular convolution computed as
+    // ifft(fft(a) . fft(c)), with ifft(z) = conj(fft(conj(z))) / M.
+    std::fill(x + _n, x + _fft_size, Complex(0.0));
+    fft_radix2(x, _fft_size, _fft_twiddle.data());
+    for (std::size_t m = 0; m < _fft_size; ++m) {
+      x[m] = std::conj(mul(x[m], _chirp_fft[m]));
+    }
+    fft_radix2(x, _fft_size, _fft_twiddle.data());
+    const double scale = 1.0 / static_cast<double>(_fft_size);
+    for (std::size_t k = 0; k < _k; ++k) {
+      x[k] = mul(std::conj(x[k]) * scale, std::conj(_chirp[k]));
+    }
+  }
+
+  // The recursion in update_bins() tracks the conjugate of X_k.
   for (std::size_t k = 0; k < _k; ++k) {
-    _yr[k] = xr[k];
-    _yi[k] = -xi[k];
+    _yr[k] = static_cast<data_t>(x[k].real());
+    _yi[k] = static_cast<data_t>(-x[k].imag());
   }
 }

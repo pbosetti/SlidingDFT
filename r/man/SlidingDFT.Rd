@@ -21,8 +21,8 @@ Computations run in double precision. Objects hold a pointer to
   \item{`SlidingDFT$new(window_size, renorm_interval = 4096)`}{
     `window_size` is the number of samples in the analysis window (any
     positive integer, not necessarily a power of two). `renorm_interval`
-    is the number of updates between phase renormalizations, which bound
-    floating-point drift.}
+    is the number of updates between exact recomputations of the bins,
+    which bound floating-point drift.}
 }
 }
 
