@@ -4,6 +4,7 @@
 #include <SlidingDFT/types.hpp>
 
 #include <complex>
+#include <span>
 
 /**
  * @class SlidingDFT
@@ -22,7 +23,8 @@ public:
    * @param window_size Number of samples in the analysis window.
    * @param renorm_interval Number of updates between exact recomputations
    *        of the bins, which bound floating-point drift.
-   * @throws std::invalid_argument If @p window_size is zero.
+   * @throws std::invalid_argument If @p window_size or @p renorm_interval is
+   *         zero.
    */
   SlidingDFT(std::size_t window_size, std::size_t renorm_interval = 4096);
 
@@ -31,6 +33,15 @@ public:
    * @param sample New sample value.
    */
   void update(data_t sample);
+
+  /**
+   * @brief Push a block of samples into the window, oldest first.
+   *
+   * Gives exactly the same result as calling update() on each sample, but is
+   * faster: consecutive samples are applied to each bin in one pass.
+   * @param samples New sample values.
+   */
+  void update(std::span<const data_t> samples);
 
   /**
    * @brief Compute the current power spectrum.
@@ -45,7 +56,7 @@ public:
   [[nodiscard]] std::size_t bins() const noexcept;
 
 private:
-  void update_bins(data_t delta);
+  template <std::size_t Count> void update_bins(const data_t *deltas);
   void power(data_t *out) const;
   void recompute_fft_like();
 
@@ -54,11 +65,11 @@ private:
   vec_t _buffer;
   vec_t _yr;
   vec_t _yi;
-  vec_t _wr;
-  vec_t _wi;
+  // Twiddles w_k = e^{-i 2 pi k / N} = _cos[k] - i _sin[k].
+  vec_t _cos;
+  vec_t _sin;
   std::size_t _index;
-  std::size_t _filled;
-  std::size_t _count;
+  std::size_t _until_renorm;
   std::size_t _renorm_interval;
   // FFT used by recompute_fft_like(): radix-2 of size _fft_size, with
   // Bluestein's algorithm when the window size is not a power of two.

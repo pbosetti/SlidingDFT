@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -108,6 +109,26 @@ void BM_SlidingDFT(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations());
 }
 
+void BM_SlidingDFT_Batch(benchmark::State &state) {
+  const auto n = static_cast<std::size_t>(state.range(0));
+  const auto hop = static_cast<std::size_t>(state.range(1));
+  const auto &sig = signal();
+  SlidingDFT sdft(n);
+  SlidingDFT::vec_t out;
+  sdft.update(std::span(sig.data(), n));
+  std::size_t start = n;
+  for (auto _ : state) {
+    if (start + hop > SignalLength) {
+      start = 0;
+    }
+    sdft.update(std::span(sig.data() + start, hop));
+    start += hop;
+    sdft.get_power(out);
+    benchmark::DoNotOptimize(out.data());
+  }
+  state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(hop));
+}
+
 void BM_PocketFFT(benchmark::State &state) {
   const auto n = static_cast<std::size_t>(state.range(0));
   const auto hop = static_cast<std::size_t>(state.range(1));
@@ -165,6 +186,18 @@ bool check_agreement() {
     std::vector<data_t> b;
     fft.get_power(b);
 
+    // Block updates in uneven chunks must match per-sample updates exactly.
+    SlidingDFT batch(n);
+    constexpr std::size_t Chunks[] = {1, 7, 13};
+    for (std::size_t i = 0, c = 0; i < Samples; ++c) {
+      const std::size_t len = std::min(Chunks[c % 3], Samples - i);
+      batch.update(std::span(sig.data() + i, len));
+      i += len;
+    }
+    SlidingDFT::vec_t a_batch;
+    batch.get_power(a_batch);
+    const bool identical = a_batch == a;
+
     double max_diff = 0.0;
     double max_ref = 0.0;
     for (std::size_t k = 0; k < b.size(); ++k) {
@@ -174,9 +207,10 @@ bool check_agreement() {
       max_ref = std::max(max_ref, bk);
     }
     const double rel_err = max_diff / max_ref;
-    const bool pass = rel_err <= Tolerance;
-    std::fprintf(stderr, "check N=%zu max_rel_err=%.3e tol=%.1e %s\n", n,
-                 rel_err, Tolerance, pass ? "OK" : "FAIL");
+    const bool pass = rel_err <= Tolerance && identical;
+    std::fprintf(stderr, "check N=%zu max_rel_err=%.3e tol=%.1e batch=%s %s\n",
+                 n, rel_err, Tolerance, identical ? "identical" : "DIFFERENT",
+                 pass ? "OK" : "FAIL");
     ok = ok && pass;
   }
   return ok;
@@ -186,6 +220,9 @@ bool check_agreement() {
 
 BENCHMARK(BM_SlidingDFT_Update)->Apply(update_args)->ArgNames({"N"});
 BENCHMARK(BM_SlidingDFT)->Apply(window_and_hop_args)->ArgNames({"N", "hop"});
+BENCHMARK(BM_SlidingDFT_Batch)
+    ->Apply(window_and_hop_args)
+    ->ArgNames({"N", "hop"});
 BENCHMARK(BM_PocketFFT)->Apply(window_and_hop_args)->ArgNames({"N", "hop"});
 
 int main(int argc, char **argv) {

@@ -55,12 +55,18 @@ You can also push a sequence in one call:
 sdft.extend([0.0, 1.0, 0.0, -1.0])
 ```
 
+`extend()` gives the same result as calling `update()` on each sample, but makes
+a single native call, so it is much faster. Contiguous buffers of the native
+sample type, such as `array.array("f")` or a NumPy `float32` array for the
+default `float` build, are copied without per-element conversion.
+
 ## Selecting The Shared Library
 
 The wrapper searches these locations by default:
 
 - `build/`
 - `build/lib/`
+- `build/Release/` (multi-config generators such as Visual Studio)
 - `python/`
 - the exact path from `SLIDINGDFT_LIBRARY`
 

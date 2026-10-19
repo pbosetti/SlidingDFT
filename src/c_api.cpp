@@ -1,8 +1,10 @@
 #include <SlidingDFT/c_api.h>
 #include <SlidingDFT/sliding_dft.hpp>
 
+#include <algorithm>
 #include <exception>
 #include <memory>
+#include <span>
 #include <string>
 
 struct SlidingDFTHandle {
@@ -10,6 +12,8 @@ struct SlidingDFTHandle {
       : instance(window_size, renorm_interval) {}
 
   SlidingDFT instance;
+  // Reused by sliding_dft_get_power() to avoid an allocation per call.
+  mutable SlidingDFT::vec_t power;
 };
 
 namespace {
@@ -59,6 +63,30 @@ int sliding_dft_update(SlidingDFTHandle *handle, data_t sample) {
   }
 }
 
+int sliding_dft_update_many(SlidingDFTHandle *handle, const data_t *samples,
+                            std::size_t count) {
+  if (handle == nullptr) {
+    set_error("null SlidingDFT handle");
+    return -1;
+  }
+  if (samples == nullptr && count > 0) {
+    set_error("null sample buffer");
+    return -1;
+  }
+
+  try {
+    LastError.clear();
+    handle->instance.update(std::span(samples, count));
+    return 0;
+  } catch (const std::exception &error) {
+    set_error(error);
+    return -1;
+  } catch (...) {
+    set_error("unknown error");
+    return -1;
+  }
+}
+
 std::size_t sliding_dft_bins(const SlidingDFTHandle *handle) {
   if (handle == nullptr) {
     set_error("null SlidingDFT handle");
@@ -85,16 +113,14 @@ int sliding_dft_get_power(const SlidingDFTHandle *handle, data_t *out,
   try {
     LastError.clear();
 
-    SlidingDFT::vec_t power;
+    SlidingDFT::vec_t &power = handle->power;
     handle->instance.get_power(power);
     if (out_size < power.size()) {
       set_error("output buffer too small");
       return -1;
     }
 
-    for (std::size_t i = 0; i < power.size(); ++i) {
-      out[i] = power[i];
-    }
+    std::copy(power.begin(), power.end(), out);
     return 0;
   } catch (const std::exception &error) {
     set_error(error);

@@ -27,6 +27,8 @@ def _candidate_paths() -> list[Path]:
   for filename in filenames:
     candidates.append(root / "build" / filename)
     candidates.append(root / "build" / "lib" / filename)
+    # Multi-config generators (Visual Studio, Xcode)
+    candidates.append(root / "build" / "Release" / filename)
     candidates.append(root / "python" / filename)
     candidates.append(Path(filename))
 
@@ -78,6 +80,13 @@ class _Api:
     self._lib.sliding_dft_update.argtypes = [ctypes.c_void_p, self._sample_t]
     self._lib.sliding_dft_update.restype = ctypes.c_int
 
+    self._lib.sliding_dft_update_many.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(self._sample_t),
+        ctypes.c_size_t,
+    ]
+    self._lib.sliding_dft_update_many.restype = ctypes.c_int
+
     self._lib.sliding_dft_bins.argtypes = [ctypes.c_void_p]
     self._lib.sliding_dft_bins.restype = ctypes.c_size_t
 
@@ -90,6 +99,20 @@ class _Api:
 
     self._lib.sliding_dft_last_error.argtypes = []
     self._lib.sliding_dft_last_error.restype = ctypes.c_char_p
+
+  def sample_buffer(self, samples: Iterable[float]) -> ctypes.Array:
+    # Contiguous buffers of the native sample type (array.array, NumPy arrays)
+    # are copied in one go; anything else is converted element by element.
+    try:
+      view = memoryview(samples)  # type: ignore[arg-type]
+    except TypeError:
+      view = None
+    native_format = "f" if self._sample_t is ctypes.c_float else "d"
+    if (view is not None and view.ndim == 1 and view.c_contiguous and
+        view.format == native_format):
+      return (self._sample_t * len(view)).from_buffer_copy(view)
+    values = list(samples)
+    return (self._sample_t * len(values))(*values)
 
   def error_message(self) -> str:
     message = self._lib.sliding_dft_last_error()
@@ -131,8 +154,11 @@ class SlidingDFT:
       raise RuntimeError(self._api.error_message())
 
   def extend(self, samples: Iterable[float]) -> None:
-    for sample in samples:
-      self.update(sample)
+    buffer = self._api.sample_buffer(samples)
+    status = self._api._lib.sliding_dft_update_many(
+        self._handle, buffer, len(buffer))
+    if status != 0:
+      raise RuntimeError(self._api.error_message())
 
   def get_power(self) -> list[float]:
     size = self.bins

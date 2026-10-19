@@ -7,33 +7,89 @@
 #include <stdexcept>
 #include <utility>
 
+// MSVC never defines __FMA__, but its /arch:AVX2 implies FMA3 support.
+#if defined(__AVX2__) &&                                                       \
+    (defined(__FMA__) || (defined(_MSC_VER) && !defined(__clang__)))
+#define SLIDINGDFT_HAS_FMA
+#endif
+
 namespace {
+
+// Minimal SIMD layer, one backend per target. mul_add(a, b, c) is a * b + c and
+// neg_mul_add(a, b, c) is c - a * b.
+namespace simd {
 
 #if defined(__AVX2__) && defined(SLIDINGDFT_USE_DOUBLE)
 using vec = __m256d;
-
+constexpr std::size_t width = VEC_WIDTH;
 inline vec load(const data_t *p) { return _mm256_load_pd(p); }
-
 inline void store(data_t *p, vec v) { _mm256_store_pd(p, v); }
+inline vec splat(data_t x) { return _mm256_set1_pd(x); }
+inline vec add(vec a, vec b) { return _mm256_add_pd(a, b); }
+inline vec mul(vec a, vec b) { return _mm256_mul_pd(a, b); }
+#if defined(SLIDINGDFT_HAS_FMA)
+inline vec mul_add(vec a, vec b, vec c) { return _mm256_fmadd_pd(a, b, c); }
+inline vec neg_mul_add(vec a, vec b, vec c) {
+  return _mm256_fnmadd_pd(a, b, c);
+}
+#else
+inline vec mul_add(vec a, vec b, vec c) { return add(mul(a, b), c); }
+inline vec neg_mul_add(vec a, vec b, vec c) {
+  return _mm256_sub_pd(c, mul(a, b));
+}
+#endif
 #elif defined(__AVX2__)
 using vec = __m256;
-
+constexpr std::size_t width = VEC_WIDTH;
 inline vec load(const data_t *p) { return _mm256_load_ps(p); }
-
 inline void store(data_t *p, vec v) { _mm256_store_ps(p, v); }
+inline vec splat(data_t x) { return _mm256_set1_ps(x); }
+inline vec add(vec a, vec b) { return _mm256_add_ps(a, b); }
+inline vec mul(vec a, vec b) { return _mm256_mul_ps(a, b); }
+#if defined(SLIDINGDFT_HAS_FMA)
+inline vec mul_add(vec a, vec b, vec c) { return _mm256_fmadd_ps(a, b, c); }
+inline vec neg_mul_add(vec a, vec b, vec c) {
+  return _mm256_fnmadd_ps(a, b, c);
+}
+#else
+inline vec mul_add(vec a, vec b, vec c) { return add(mul(a, b), c); }
+inline vec neg_mul_add(vec a, vec b, vec c) {
+  return _mm256_sub_ps(c, mul(a, b));
+}
+#endif
 #elif defined(__ARM_NEON) && defined(SLIDINGDFT_USE_DOUBLE)
 using vec = float64x2_t;
-
+constexpr std::size_t width = VEC_WIDTH;
 inline vec load(const data_t *p) { return vld1q_f64(p); }
-
 inline void store(data_t *p, vec v) { vst1q_f64(p, v); }
+inline vec splat(data_t x) { return vdupq_n_f64(x); }
+inline vec add(vec a, vec b) { return vaddq_f64(a, b); }
+inline vec mul(vec a, vec b) { return vmulq_f64(a, b); }
+inline vec mul_add(vec a, vec b, vec c) { return vfmaq_f64(c, a, b); }
+inline vec neg_mul_add(vec a, vec b, vec c) { return vfmsq_f64(c, a, b); }
 #elif defined(__ARM_NEON)
 using vec = float32x4_t;
-
+constexpr std::size_t width = VEC_WIDTH;
 inline vec load(const data_t *p) { return vld1q_f32(p); }
-
 inline void store(data_t *p, vec v) { vst1q_f32(p, v); }
+inline vec splat(data_t x) { return vdupq_n_f32(x); }
+inline vec add(vec a, vec b) { return vaddq_f32(a, b); }
+inline vec mul(vec a, vec b) { return vmulq_f32(a, b); }
+inline vec mul_add(vec a, vec b, vec c) { return vfmaq_f32(c, a, b); }
+inline vec neg_mul_add(vec a, vec b, vec c) { return vfmsq_f32(c, a, b); }
+#else
+using vec = data_t;
+constexpr std::size_t width = 1;
+inline vec load(const data_t *p) { return *p; }
+inline void store(data_t *p, vec v) { *p = v; }
+inline vec splat(data_t x) { return x; }
+inline vec add(vec a, vec b) { return a + b; }
+inline vec mul(vec a, vec b) { return a * b; }
+inline vec mul_add(vec a, vec b, vec c) { return a * b + c; }
+inline vec neg_mul_add(vec a, vec b, vec c) { return c - a * b; }
 #endif
+
+} // namespace simd
 
 using Complex = std::complex<double>;
 
@@ -69,23 +125,51 @@ void fft_radix2(Complex *x, std::size_t m, const Complex *twiddle) {
   }
 }
 
+// State arrays are padded to whole SIMD vectors, so the per-sample kernel has
+// no scalar tail. Padded bins have w = 0 and stay exactly zero.
+constexpr std::size_t padded_bins(std::size_t bins) {
+  return (bins + simd::width - 1) / simd::width * simd::width;
+}
+
+// Count consecutive updates y <- (y + delta_j) * w of one bin vector, keeping y
+// in registers, with w = c - i s. Every caller goes through this kernel, so
+// pushing samples one at a time or in blocks gives identical results.
+template <std::size_t Count>
+inline void rotate_bins(data_t *yr, data_t *yi, const data_t *wc,
+                        const data_t *ws, const simd::vec *deltas) {
+  simd::vec r = simd::load(yr);
+  simd::vec i = simd::load(yi);
+  const simd::vec c = simd::load(wc);
+  const simd::vec s = simd::load(ws);
+  for (std::size_t j = 0; j < Count; ++j) {
+    const simd::vec a = simd::add(r, deltas[j]);
+    r = simd::mul_add(a, c, simd::mul(i, s));     // a c + i s
+    i = simd::neg_mul_add(a, s, simd::mul(i, c)); // i c - a s
+  }
+  simd::store(yr, r);
+  simd::store(yi, i);
+}
+
 } // namespace
 
 SlidingDFT::SlidingDFT(std::size_t window_size, std::size_t renorm_interval)
     : _n(window_size), _k(window_size / 2 + 1), _buffer(window_size, 0),
-      _yr(_k, 0), _yi(_k, 0), _wr(_k, 0), _wi(_k, 0), _index(0), _filled(0),
-      _count(0), _renorm_interval(renorm_interval) {
+      _yr(padded_bins(_k), 0), _yi(padded_bins(_k), 0),
+      _cos(padded_bins(_k), 0), _sin(padded_bins(_k), 0), _index(0),
+      _until_renorm(renorm_interval), _renorm_interval(renorm_interval) {
   if (_n == 0) {
     throw std::invalid_argument("N > 0 required");
   }
+  if (_renorm_interval == 0) {
+    throw std::invalid_argument("renorm_interval > 0 required");
+  }
 
-  const data_t two_pi_over_n = static_cast<data_t>(
-      2.0 * std::numbers::pi_v<double> / static_cast<double>(_n));
-
+  // Twiddles w_k = e^{-i 2 pi k / N}, computed in double and then rounded.
   for (std::size_t k = 0; k < _k; ++k) {
-    const data_t angle = two_pi_over_n * static_cast<data_t>(k);
-    _wr[k] = std::cos(angle);
-    _wi[k] = -std::sin(angle);
+    const double angle = 2.0 * std::numbers::pi_v<double> *
+                         static_cast<double>(k) / static_cast<double>(_n);
+    _cos[k] = static_cast<data_t>(std::cos(angle));
+    _sin[k] = static_cast<data_t>(std::sin(angle));
   }
 
   _fft_size = std::has_single_bit(_n) ? _n : std::bit_ceil(2 * _n - 1);
@@ -118,19 +202,53 @@ SlidingDFT::SlidingDFT(std::size_t window_size, std::size_t renorm_interval)
 }
 
 void SlidingDFT::update(data_t sample) {
-  const data_t old_sample = _buffer[_index];
+  const data_t delta = sample - _buffer[_index];
   _buffer[_index] = sample;
-  _index = (_index + 1) % _n;
-
-  if (_filled < _n) {
-    ++_filled;
+  if (++_index == _n) {
+    _index = 0;
   }
 
-  const data_t delta = sample - old_sample;
-  update_bins(delta);
+  update_bins<1>(&delta);
 
-  if (++_count % _renorm_interval == 0) {
+  if (--_until_renorm == 0) {
+    _until_renorm = _renorm_interval;
     recompute_fft_like();
+  }
+}
+
+void SlidingDFT::update(std::span<const data_t> samples) {
+  // Blocks of samples share one pass over the bins, with the bins held in
+  // registers. A block never straddles a recomputation, so the result is the
+  // same as with per-sample updates. Larger blocks run out of registers.
+  constexpr std::size_t Block = 4;
+  data_t deltas[Block] = {};
+  std::size_t pos = 0;
+  while (pos < samples.size()) {
+    const std::size_t count =
+        std::min({Block, samples.size() - pos, _until_renorm});
+    for (std::size_t j = 0; j < count; ++j) {
+      const data_t sample = samples[pos + j];
+      deltas[j] = sample - _buffer[_index];
+      _buffer[_index] = sample;
+      if (++_index == _n) {
+        _index = 0;
+      }
+    }
+
+    if (count == Block) {
+      update_bins<Block>(deltas);
+    } else {
+      for (std::size_t j = 0; j < count; ++j) {
+        update_bins<1>(deltas + j);
+      }
+    }
+
+    pos += count;
+    _until_renorm -= count;
+    if (_until_renorm == 0) {
+      _until_renorm = _renorm_interval;
+      recompute_fft_like();
+    }
   }
 }
 
@@ -141,166 +259,58 @@ void SlidingDFT::get_power(vec_t &power_spectrum) const {
 
 std::size_t SlidingDFT::bins() const noexcept { return _k; }
 
-void SlidingDFT::update_bins(data_t delta) {
-#if defined(__AVX2__) && defined(SLIDINGDFT_USE_DOUBLE)
-  const vec vdelta = _mm256_set1_pd(delta);
+// Kernels work on local copies of the member pointers and sizes: SIMD stores
+// may alias any object, so going through the members would reload them from
+// memory on every iteration.
+
+template <std::size_t Count>
+void SlidingDFT::update_bins(const data_t *deltas) {
+  data_t *yr = _yr.data();
+  data_t *yi = _yi.data();
+  const data_t *wc = _cos.data();
+  const data_t *ws = _sin.data();
+  const std::size_t bins = _yr.size(); // a multiple of simd::width
+
+  simd::vec vdeltas[Count];
+  for (std::size_t j = 0; j < Count; ++j) {
+    vdeltas[j] = simd::splat(deltas[j]);
+  }
+
+  // Two vectors per iteration, then at most one more.
+  constexpr std::size_t w = simd::width;
   std::size_t k = 0;
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    vec yr = load(&_yr[k]);
-    const vec yi = load(&_yi[k]);
-    const vec wr = load(&_wr[k]);
-    const vec wi = load(&_wi[k]);
-
-    yr = _mm256_add_pd(yr, vdelta);
-
-#if defined(__FMA__)
-    const vec real = _mm256_fmsub_pd(yr, wr, _mm256_mul_pd(yi, wi));
-    const vec imag = _mm256_fmadd_pd(yr, wi, _mm256_mul_pd(yi, wr));
-#else
-    const vec real =
-        _mm256_sub_pd(_mm256_mul_pd(yr, wr), _mm256_mul_pd(yi, wi));
-    const vec imag =
-        _mm256_add_pd(_mm256_mul_pd(yr, wi), _mm256_mul_pd(yi, wr));
-#endif
-
-    store(&_yr[k], real);
-    store(&_yi[k], imag);
+  for (; k + 2 * w <= bins; k += 2 * w) {
+    rotate_bins<Count>(yr + k, yi + k, wc + k, ws + k, vdeltas);
+    rotate_bins<Count>(yr + k + w, yi + k + w, wc + k + w, ws + k + w, vdeltas);
   }
-
-  for (; k < _k; ++k) {
-    const data_t yr = _yr[k] + delta;
-    const data_t yi = _yi[k];
-    _yr[k] = yr * _wr[k] - yi * _wi[k];
-    _yi[k] = yr * _wi[k] + yi * _wr[k];
+  if (k < bins) {
+    rotate_bins<Count>(yr + k, yi + k, wc + k, ws + k, vdeltas);
   }
-#elif defined(__AVX2__)
-  const vec vdelta = _mm256_set1_ps(delta);
-  std::size_t k = 0;
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    vec yr = load(&_yr[k]);
-    const vec yi = load(&_yi[k]);
-    const vec wr = load(&_wr[k]);
-    const vec wi = load(&_wi[k]);
-
-    yr = _mm256_add_ps(yr, vdelta);
-
-#if defined(__FMA__)
-    const vec real = _mm256_fmsub_ps(yr, wr, _mm256_mul_ps(yi, wi));
-    const vec imag = _mm256_fmadd_ps(yr, wi, _mm256_mul_ps(yi, wr));
-#else
-    const vec real =
-        _mm256_sub_ps(_mm256_mul_ps(yr, wr), _mm256_mul_ps(yi, wi));
-    const vec imag =
-        _mm256_add_ps(_mm256_mul_ps(yr, wi), _mm256_mul_ps(yi, wr));
-#endif
-
-    store(&_yr[k], real);
-    store(&_yi[k], imag);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t yr = _yr[k] + delta;
-    const data_t yi = _yi[k];
-    _yr[k] = yr * _wr[k] - yi * _wi[k];
-    _yi[k] = yr * _wi[k] + yi * _wr[k];
-  }
-#elif defined(__ARM_NEON) && defined(SLIDINGDFT_USE_DOUBLE)
-  const vec vdelta = vdupq_n_f64(delta);
-  std::size_t k = 0;
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    vec yr = load(&_yr[k]);
-    const vec yi = load(&_yi[k]);
-    const vec wr = load(&_wr[k]);
-    const vec wi = load(&_wi[k]);
-
-    yr = vaddq_f64(yr, vdelta);
-
-    const vec real = vsubq_f64(vmulq_f64(yr, wr), vmulq_f64(yi, wi));
-    const vec imag = vaddq_f64(vmulq_f64(yr, wi), vmulq_f64(yi, wr));
-
-    store(&_yr[k], real);
-    store(&_yi[k], imag);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t yr = _yr[k] + delta;
-    const data_t yi = _yi[k];
-    _yr[k] = yr * _wr[k] - yi * _wi[k];
-    _yi[k] = yr * _wi[k] + yi * _wr[k];
-  }
-#elif defined(__ARM_NEON)
-  const vec vdelta = vdupq_n_f32(delta);
-  std::size_t k = 0;
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    vec yr = load(&_yr[k]);
-    const vec yi = load(&_yi[k]);
-    const vec wr = load(&_wr[k]);
-    const vec wi = load(&_wi[k]);
-
-    yr = vaddq_f32(yr, vdelta);
-
-    const vec real = vsubq_f32(vmulq_f32(yr, wr), vmulq_f32(yi, wi));
-    const vec imag = vaddq_f32(vmulq_f32(yr, wi), vmulq_f32(yi, wr));
-
-    store(&_yr[k], real);
-    store(&_yi[k], imag);
-  }
-
-  for (; k < _k; ++k) {
-    const data_t yr = _yr[k] + delta;
-    const data_t yi = _yi[k];
-    _yr[k] = yr * _wr[k] - yi * _wi[k];
-    _yi[k] = yr * _wi[k] + yi * _wr[k];
-  }
-#else
-  for (std::size_t k = 0; k < _k; ++k) {
-    const data_t yr = _yr[k] + delta;
-    const data_t yi = _yi[k];
-    _yr[k] = yr * _wr[k] - yi * _wi[k];
-    _yi[k] = yr * _wi[k] + yi * _wr[k];
-  }
-#endif
 }
 
 void SlidingDFT::power(data_t *out) const {
-  std::size_t k = 0;
-#if defined(__AVX2__) && defined(SLIDINGDFT_USE_DOUBLE)
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    const vec yr = load(&_yr[k]);
-    const vec yi = load(&_yi[k]);
-#if defined(__FMA__)
-    store(&out[k], _mm256_fmadd_pd(yr, yr, _mm256_mul_pd(yi, yi)));
-#else
-    store(&out[k], _mm256_add_pd(_mm256_mul_pd(yr, yr), _mm256_mul_pd(yi, yi)));
-#endif
-  }
-#elif defined(__AVX2__)
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    const vec yr = load(&_yr[k]);
-    const vec yi = load(&_yi[k]);
-#if defined(__FMA__)
-    store(&out[k], _mm256_fmadd_ps(yr, yr, _mm256_mul_ps(yi, yi)));
-#else
-    store(&out[k], _mm256_add_ps(_mm256_mul_ps(yr, yr), _mm256_mul_ps(yi, yi)));
-#endif
-  }
-#elif defined(__ARM_NEON) && defined(SLIDINGDFT_USE_DOUBLE)
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    const vec yr = load(&_yr[k]);
-    const vec yi = load(&_yi[k]);
-    store(&out[k], vaddq_f64(vmulq_f64(yr, yr), vmulq_f64(yi, yi)));
-  }
-#elif defined(__ARM_NEON)
-  for (; k + VEC_WIDTH <= _k; k += VEC_WIDTH) {
-    const vec yr = load(&_yr[k]);
-    const vec yi = load(&_yi[k]);
-    store(&out[k], vaddq_f32(vmulq_f32(yr, yr), vmulq_f32(yi, yi)));
-  }
-#endif
+  const data_t *yr = _yr.data();
+  const data_t *yi = _yi.data();
+  const std::size_t bins = _k;
+
   // |X_k|^2 = |y_k|^2: y_k is the conjugate of the DFT of the window ordered
   // from the oldest sample, so no phase reference is needed.
-  for (; k < _k; ++k) {
-    out[k] = _yr[k] * _yr[k] + _yi[k] * _yi[k];
+  const auto norm = [&](std::size_t k) {
+    const simd::vec r = simd::load(yr + k);
+    const simd::vec i = simd::load(yi + k);
+    simd::store(out + k, simd::mul_add(r, r, simd::mul(i, i)));
+  };
+  std::size_t k = 0;
+  for (; k + 2 * simd::width <= bins; k += 2 * simd::width) {
+    norm(k);
+    norm(k + simd::width);
+  }
+  if (k + simd::width <= bins) {
+    norm(k);
+    k += simd::width;
+  }
+  for (; k < bins; ++k) {
+    out[k] = yr[k] * yr[k] + yi[k] * yi[k];
   }
 }
 

@@ -124,11 +124,20 @@ endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND
    CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64|i[3-6]86)$")
-  target_compile_options(SlidingDFT PRIVATE -mavx2)
-  target_compile_options(SlidingDFTC PRIVATE -mavx2)
-  target_compile_options(sliding_dft_example PRIVATE -mavx2)
+  target_compile_options(SlidingDFT PRIVATE -mavx2 -mfma)
+  target_compile_options(SlidingDFTC PRIVATE -mavx2 -mfma)
+  target_compile_options(sliding_dft_example PRIVATE -mavx2 -mfma)
   if(TARGET sliding_dft_benchmark)
-    target_compile_options(sliding_dft_benchmark PRIVATE -mavx2)
+    target_compile_options(sliding_dft_benchmark PRIVATE -mavx2 -mfma)
+  endif()
+elseif(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(x64|X86)$")
+  # The target architecture: CMAKE_SYSTEM_PROCESSOR is the host's on Windows.
+  # /arch:AVX2 also enables FMA3 code generation.
+  target_compile_options(SlidingDFT PRIVATE /arch:AVX2)
+  target_compile_options(SlidingDFTC PRIVATE /arch:AVX2)
+  target_compile_options(sliding_dft_example PRIVATE /arch:AVX2)
+  if(TARGET sliding_dft_benchmark)
+    target_compile_options(sliding_dft_benchmark PRIVATE /arch:AVX2)
   endif()
 endif()
 

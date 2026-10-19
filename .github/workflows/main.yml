@@ -21,6 +21,11 @@ jobs:
             runs_on: macos-15-intel
           - os_name: macOS arm64
             runs_on: macos-15
+          # Default Visual Studio generator, i.e. MSVC; multi-config, so the
+          # binaries land in build/Release.
+          - os_name: Windows x86_64 (MSVC)
+            runs_on: windows-2025
+            benchmark: ./build/Release/sliding_dft_benchmark.exe
 
     steps:
       - name: Checkout
@@ -36,4 +41,4 @@ jobs:
         run: ctest --test-dir build --build-config Release --output-on-failure
 
       - name: Benchmark smoke run
-        run: ./build/sliding_dft_benchmark --benchmark_min_time=0.01s
+        run: ${{ matrix.benchmark || './build/sliding_dft_benchmark' }} --benchmark_min_time=0.01s

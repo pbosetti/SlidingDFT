@@ -54,6 +54,20 @@ SLIDINGDFT_C_API void sliding_dft_destroy(SlidingDFTHandle *handle);
 SLIDINGDFT_C_API int sliding_dft_update(SlidingDFTHandle *handle, data_t sample);
 
 /**
+ * @brief Push a block of samples into the analysis window, oldest first.
+ * @param handle Sliding DFT handle.
+ * @param samples Input samples, `count` elements.
+ * @param count Number of samples; `0` is allowed.
+ * @return `0` on success, `-1` on error.
+ *
+ * Gives the same result as calling sliding_dft_update() on each sample, but is
+ * much faster. On failure, call sliding_dft_last_error() for details.
+ */
+SLIDINGDFT_C_API int sliding_dft_update_many(SlidingDFTHandle *handle,
+                                             const data_t *samples,
+                                             std::size_t count);
+
+/**
  * @brief Return the number of frequency bins for an instance.
  * @param handle Sliding DFT handle.
  * @return The number of bins, or `0` on error.

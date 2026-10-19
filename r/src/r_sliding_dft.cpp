@@ -2,7 +2,13 @@
 
 #include <SlidingDFT/sliding_dft.hpp>
 
+#include <span>
+#include <type_traits>
+
 namespace {
+
+static_assert(std::is_same_v<data_t, double>,
+              "the R package is built with SLIDINGDFT_USE_DOUBLE");
 
 class RSlidingDFT {
 public:
@@ -13,9 +19,8 @@ public:
               checked_size(renorm_interval, "renorm_interval")) {}
 
   void update(const Rcpp::NumericVector &samples) {
-    for (const double sample : samples) {
-      _sdft.update(sample);
-    }
+    _sdft.update(std::span<const data_t>(
+        samples.begin(), static_cast<std::size_t>(samples.size())));
   }
 
   Rcpp::NumericVector get_power() const {
