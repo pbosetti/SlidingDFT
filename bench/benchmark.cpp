@@ -7,8 +7,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <map>
 #include <random>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -88,7 +91,7 @@ void BM_SlidingDFT_Update(benchmark::State &state) {
 
 void BM_SlidingDFT(benchmark::State &state) {
   const auto n = static_cast<std::size_t>(state.range(0));
-  const auto hop = static_cast<std::size_t>(state.range(1));
+  const auto power_every = static_cast<std::size_t>(state.range(1));
   const auto &sig = signal();
   SlidingDFT sdft(n);
   SlidingDFT::vec_t out;
@@ -100,7 +103,7 @@ void BM_SlidingDFT(benchmark::State &state) {
   for (auto _ : state) {
     sdft.update(sig[i & SignalMask]);
     ++i;
-    if (++since_power == hop) {
+    if (++since_power == power_every) {
       since_power = 0;
       sdft.get_power(out);
       benchmark::DoNotOptimize(out.data());
@@ -109,29 +112,36 @@ void BM_SlidingDFT(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations());
 }
 
+// A spectrum every power_every samples, which arrive in update() calls of
+// batch samples (the last call of each period may be shorter).
 void BM_SlidingDFT_Batch(benchmark::State &state) {
   const auto n = static_cast<std::size_t>(state.range(0));
-  const auto hop = static_cast<std::size_t>(state.range(1));
+  const auto power_every = static_cast<std::size_t>(state.range(1));
+  const auto batch = static_cast<std::size_t>(state.range(2));
   const auto &sig = signal();
   SlidingDFT sdft(n);
   SlidingDFT::vec_t out;
   sdft.update(std::span(sig.data(), n));
   std::size_t start = n;
   for (auto _ : state) {
-    if (start + hop > SignalLength) {
+    if (start + power_every > SignalLength) {
       start = 0;
     }
-    sdft.update(std::span(sig.data() + start, hop));
-    start += hop;
+    for (std::size_t pushed = 0; pushed < power_every; pushed += batch) {
+      const std::size_t len = std::min(batch, power_every - pushed);
+      sdft.update(std::span(sig.data() + start + pushed, len));
+    }
+    start += power_every;
     sdft.get_power(out);
     benchmark::DoNotOptimize(out.data());
   }
-  state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(hop));
+  state.SetItemsProcessed(state.iterations() *
+                          static_cast<std::int64_t>(power_every));
 }
 
 void BM_PocketFFT(benchmark::State &state) {
   const auto n = static_cast<std::size_t>(state.range(0));
-  const auto hop = static_cast<std::size_t>(state.range(1));
+  const auto power_every = static_cast<std::size_t>(state.range(1));
   const auto &sig = signal();
   FftStream fft(n);
   std::vector<data_t> out;
@@ -143,7 +153,7 @@ void BM_PocketFFT(benchmark::State &state) {
   for (auto _ : state) {
     fft.push(sig[i & SignalMask]);
     ++i;
-    if (++since_power == hop) {
+    if (++since_power == power_every) {
       since_power = 0;
       fft.get_power(out);
       benchmark::DoNotOptimize(out.data());
@@ -152,18 +162,46 @@ void BM_PocketFFT(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations());
 }
 
+constexpr std::int64_t WindowSizes[] = {64, 256, 300, 1000, 1024, 4096};
+
 void update_args(benchmark::Benchmark *b) {
-  for (const std::int64_t n : {64, 256, 300, 1000, 1024, 4096}) {
+  for (const std::int64_t n : WindowSizes) {
     b->Arg(n);
   }
 }
 
-void window_and_hop_args(benchmark::Benchmark *b) {
-  for (const std::int64_t n : {64, 256, 300, 1000, 1024, 4096}) {
-    b->Args({n, 1});
-    b->Args({n, 16});
-    if (n / 4 != 16) {
-      b->Args({n, n / 4});
+// Spectrum intervals: every sample, every 16, every N/4 and every N samples
+// (non-overlapping windows), without duplicates.
+std::vector<std::int64_t> power_intervals(std::int64_t n) {
+  std::vector<std::int64_t> out;
+  for (const std::int64_t every :
+       {std::int64_t{1}, std::int64_t{16}, n / 4, n}) {
+    if (every >= 1 && std::find(out.begin(), out.end(), every) == out.end()) {
+      out.push_back(every);
+    }
+  }
+  return out;
+}
+
+void window_and_power_args(benchmark::Benchmark *b) {
+  for (const std::int64_t n : WindowSizes) {
+    for (const std::int64_t every : power_intervals(n)) {
+      b->Args({n, every});
+    }
+  }
+}
+
+// Batch sizes up to the spectrum interval, which is the largest useful one.
+void window_power_and_batch_args(benchmark::Benchmark *b) {
+  for (const std::int64_t n : WindowSizes) {
+    for (const std::int64_t every : power_intervals(n)) {
+      for (const std::int64_t batch : {std::int64_t{1}, std::int64_t{4},
+                                       std::int64_t{16}, std::int64_t{64}}) {
+        if (batch < every) {
+          b->Args({n, every, batch});
+        }
+      }
+      b->Args({n, every, every});
     }
   }
 }
@@ -216,24 +254,111 @@ bool check_agreement() {
   return ok;
 }
 
+// Tidy CSV output for --csv: one row per run, with the benchmark name split
+// into variables. batch is the number of samples pushed per update call;
+// power_every is the number of samples between spectra (NA: never computed).
+class TidyCsvReporter : public benchmark::BenchmarkReporter {
+public:
+  bool ReportContext(const Context &) override {
+    GetOutputStream() << "algorithm,precision,N,batch,power_every,repetition,"
+                         "iterations,samples_per_s,ns_per_sample\n";
+    return true;
+  }
+
+  void ReportRuns(const std::vector<Run> &runs) override {
+    for (const Run &run : runs) {
+      if (run.run_type != Run::RT_Iteration || run.skipped) {
+        continue;
+      }
+      const auto args = parse_args(run.run_name.args);
+      const std::string &fn = run.run_name.function_name;
+      const std::string n = args.at("N");
+      std::string algorithm = "pocketfft";
+      std::string batch = "1";
+      std::string power_every = "NA";
+      if (fn == "BM_SlidingDFT_Update") {
+        algorithm = "sliding_dft";
+      } else if (fn == "BM_SlidingDFT") {
+        algorithm = "sliding_dft";
+        power_every = args.at("power_every");
+      } else if (fn == "BM_SlidingDFT_Batch") {
+        algorithm = "sliding_dft_batch";
+        batch = args.at("batch");
+        power_every = args.at("power_every");
+      } else {
+        power_every = args.at("power_every");
+      }
+      const double rate = run.counters.at("items_per_second");
+      GetOutputStream() << algorithm << ','
+                        << (std::is_same_v<data_t, float> ? "float" : "double")
+                        << ',' << n << ',' << batch << ',' << power_every << ','
+                        << std::max<std::int64_t>(run.repetition_index, 0)
+                        << ',' << run.iterations << ',' << rate << ','
+                        << 1e9 / rate << '\n';
+    }
+  }
+
+private:
+  // "N:256/power_every:16" -> {N: 256, power_every: 16}
+  static std::map<std::string, std::string> parse_args(const std::string &s) {
+    std::map<std::string, std::string> out;
+    std::size_t start = 0;
+    while (start < s.size()) {
+      std::size_t end = s.find('/', start);
+      if (end == std::string::npos) {
+        end = s.size();
+      }
+      const std::string field = s.substr(start, end - start);
+      const std::size_t colon = field.find(':');
+      if (colon != std::string::npos) {
+        out[field.substr(0, colon)] = field.substr(colon + 1);
+      }
+      start = end + 1;
+    }
+    return out;
+  }
+};
+
 } // namespace
 
 BENCHMARK(BM_SlidingDFT_Update)->Apply(update_args)->ArgNames({"N"});
-BENCHMARK(BM_SlidingDFT)->Apply(window_and_hop_args)->ArgNames({"N", "hop"});
+BENCHMARK(BM_SlidingDFT)
+    ->Apply(window_and_power_args)
+    ->ArgNames({"N", "power_every"});
 BENCHMARK(BM_SlidingDFT_Batch)
-    ->Apply(window_and_hop_args)
-    ->ArgNames({"N", "hop"});
-BENCHMARK(BM_PocketFFT)->Apply(window_and_hop_args)->ArgNames({"N", "hop"});
+    ->Apply(window_power_and_batch_args)
+    ->ArgNames({"N", "power_every", "batch"});
+BENCHMARK(BM_PocketFFT)
+    ->Apply(window_and_power_args)
+    ->ArgNames({"N", "power_every"});
 
 int main(int argc, char **argv) {
   if (!check_agreement()) {
     return 1;
   }
+
+  // --csv is ours: strip it before Google Benchmark parses the rest.
+  bool csv = false;
+  int kept = 1;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--csv") == 0) {
+      csv = true;
+    } else {
+      argv[kept++] = argv[i];
+    }
+  }
+  argc = kept;
+
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
     return 1;
   }
-  benchmark::RunSpecifiedBenchmarks();
+  if (csv) {
+    TidyCsvReporter reporter;
+    benchmark::RunSpecifiedBenchmarks(&reporter);
+  } else {
+    benchmark::RunSpecifiedBenchmarks();
+  }
   benchmark::Shutdown();
   return 0;
 }

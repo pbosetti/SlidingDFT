@@ -68,37 +68,54 @@ Run all benchmarks, or filter by window size or benchmark name:
 ./build/sliding_dft_benchmark --benchmark_filter='BM_PocketFFT'
 ```
 
+For plotting, `--csv` prints a tidy CSV table to standard output, one row per
+run. It can be combined with any Google Benchmark option:
+
+```sh
+./build/sliding_dft_benchmark --csv --benchmark_repetitions=5 > bench.csv
+```
+
+The columns are `algorithm` (`sliding_dft`, `sliding_dft_batch` or
+`pocketfft`), `precision`, `N`, `batch` (samples pushed per update call),
+`power_every` (samples between spectra, `NA` if never), `repetition`,
+`iterations`, `samples_per_s` and `ns_per_sample`.
+
 There are four benchmarks, all reporting input samples per second:
 
 - `BM_SlidingDFT_Update/N`: only `update()` for each sample.
-- `BM_SlidingDFT/N/hop`: `update()` for each sample, and `get_power()` every
-  `hop` samples.
-- `BM_SlidingDFT_Batch/N/hop`: the `hop` samples are pushed with a single
-  block `update()` call, then `get_power()`.
-- `BM_PocketFFT/N/hop`: a ring buffer write for each sample and, every `hop`
-  samples, a real FFT of the last `N` samples followed by the power
-  computation. It produces the same output as `BM_SlidingDFT`.
+- `BM_SlidingDFT/N/power_every`: `update()` for each sample, and `get_power()`
+  every `power_every` samples.
+- `BM_SlidingDFT_Batch/N/power_every/batch`: the same, but samples arrive in
+  block `update()` calls of `batch` samples, from 1 up to `power_every`. The
+  result does not depend on `batch`, only the speed does.
+- `BM_PocketFFT/N/power_every`: a ring buffer write for each sample and, every
+  `power_every` samples, a real FFT of the last `N` samples followed by the
+  power computation. It produces the same output as `BM_SlidingDFT`.
 
-`N` ranges over 64 to 4096, including non-powers of two, and `hop` is 1, 16,
-or `N/4`.
+`N` ranges over 64 to 4096, including non-powers of two, and `power_every` is
+1, 16, `N/4` or `N`. At `power_every` = `N` both algorithms compute one spectrum
+per non-overlapping window.
 
 Before timing, the executable checks that both implementations produce the
 same spectrum, and that block updates match per-sample updates exactly. It
 exits with a non-zero status if they do not.
 
 To compare the two, look at the samples per second of `BM_SlidingDFT` (or
-`BM_SlidingDFT_Batch`) and `BM_PocketFFT` at the same `N` and `hop`. A sliding
-DFT costs O(N) per sample, while an FFT costs O(N log N) per transform, so the
-sliding DFT should win at small hops. At large hops the cost of the FFT is
-amortized over many samples, so the FFT can win.
+`BM_SlidingDFT_Batch`) and `BM_PocketFFT` at the same `N` and `power_every`.
+A sliding DFT costs O(N) per sample, while an FFT costs O(N log N) per
+transform, so the sliding DFT should win when spectra are frequent. When they
+are rare, the cost of the FFT is amortized over many samples, so the FFT can
+win. Within `BM_SlidingDFT_Batch`, batches of 4 samples or more run about 25%
+faster than single samples; larger batches only save call overhead.
 
 For reference, on an Apple M5 Pro (NEON, `float`):
 
-- With a spectrum after every sample (`hop` 1), the sliding DFT is about 10x
-  faster than pocketfft at `N` = 64, and 13-19x faster from `N` = 256 to 4096.
+- With a spectrum after every sample (`power_every` 1), the sliding DFT is
+  about 10x faster than pocketfft at `N` = 64, and 13-19x faster from `N` = 256
+  to 4096.
   In `double` the gain is about 7-10x.
-- At `hop` 16, block updates are still 1.2-2x faster than pocketfft.
-- At `hop` `N/4`, pocketfft is faster, by up to 30x for large `N`.
+- At `power_every` 16, block updates are still 1.2-2x faster than pocketfft.
+- At `power_every` `N/4`, pocketfft is faster, by up to 30x for large `N`.
 
 ## Precision
 
