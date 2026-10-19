@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(SLIDINGDFT_USE_DOUBLE "Build SlidingDFT with double-precision samples" OFF)
+option(SLIDINGDFT_BUILD_BENCHMARKS "Build benchmarks against pocketfft" OFF)
 
 add_library(SlidingDFT STATIC
   src/sliding_dft.cpp
@@ -56,6 +57,48 @@ add_executable(sliding_dft_example
 
 target_link_libraries(sliding_dft_example PRIVATE SlidingDFT::SlidingDFT)
 
+if(SLIDINGDFT_BUILD_BENCHMARKS)
+  include(FetchContent)
+
+  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+
+  FetchContent_Declare(
+    googlebenchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG v1.9.5
+  )
+
+  # pocketfft cpp branch
+  FetchContent_Declare(
+    pocketfft
+    GIT_REPOSITORY https://github.com/mreineck/pocketfft.git
+    GIT_TAG 4d865cba24359b05b37da4e75aee24498c3b78e7 # branch: cpp
+    SOURCE_SUBDIR does_not_exist
+  )
+
+  FetchContent_MakeAvailable(googlebenchmark pocketfft)
+
+  find_package(Threads REQUIRED)
+
+  add_library(pocketfft INTERFACE)
+  target_include_directories(pocketfft INTERFACE ${pocketfft_SOURCE_DIR})
+  target_link_libraries(pocketfft INTERFACE Threads::Threads)
+
+  add_executable(sliding_dft_benchmark
+    bench/benchmark.cpp
+  )
+
+  target_link_libraries(sliding_dft_benchmark
+    PRIVATE
+      SlidingDFT::SlidingDFT
+      benchmark::benchmark
+      pocketfft
+  )
+endif()
+
 if(BUILD_TESTING)
   add_test(
     NAME sliding_dft_example_runs
@@ -67,10 +110,16 @@ if(MSVC)
   target_compile_options(SlidingDFT PRIVATE /W4 /permissive-)
   target_compile_options(SlidingDFTC PRIVATE /W4 /permissive-)
   target_compile_options(sliding_dft_example PRIVATE /W4 /permissive-)
+  if(TARGET sliding_dft_benchmark)
+    target_compile_options(sliding_dft_benchmark PRIVATE /W4 /permissive-)
+  endif()
 else()
   target_compile_options(SlidingDFT PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(SlidingDFTC PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(sliding_dft_example PRIVATE -Wall -Wextra -Wpedantic)
+  if(TARGET sliding_dft_benchmark)
+    target_compile_options(sliding_dft_benchmark PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND
@@ -78,6 +127,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND
   target_compile_options(SlidingDFT PRIVATE -mavx2)
   target_compile_options(SlidingDFTC PRIVATE -mavx2)
   target_compile_options(sliding_dft_example PRIVATE -mavx2)
+  if(TARGET sliding_dft_benchmark)
+    target_compile_options(sliding_dft_benchmark PRIVATE -mavx2)
+  endif()
 endif()
 
 set_target_properties(SlidingDFT PROPERTIES OUTPUT_NAME SlidingDFT)

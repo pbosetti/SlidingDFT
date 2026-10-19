@@ -27,10 +27,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DSLIDINGDFT_BUILD_BENCHMARKS=ON
 
       - name: Build
         run: cmake --build build --config Release
 
       - name: Test
         run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Benchmark smoke run
+        run: ./build/sliding_dft_benchmark --benchmark_min_time=0.01s
